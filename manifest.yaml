@@ -1,0 +1,14 @@
+name: kvm
+display_name: KVM / DRBD
+description: Integration providing backup capabilities for KVM (libvirt) virtual machines, including those stored on DRBD block devices.
+api_version: v1.1.0
+tier: community
+contact: mailto:loic.harrang@roullier.com
+connectors:
+- type: importer
+  executable: kvmImporter
+  homepage: https://github.com/PlakarKorp/integration-kvm
+  license: ISC
+  protocols: [kvm]
+  validator: ./importer/schema.json
+  class: compute

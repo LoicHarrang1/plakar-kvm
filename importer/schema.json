@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KVM/DRBD connector config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "location"
+  ],
+  "properties": {
+    "location": {
+      "type": "string",
+      "minLength": 1,
+      "description": "KVM location URI: kvm://[<host>]/[system|session]. Examples: kvm:///system, kvm://node1/system",
+      "pattern": "^kvm://[^/]*/(system|session)$"
+    },
+    "connect_uri": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Explicit libvirt connection URI passed to virsh -c (overrides the URI derived from location). Example: qemu+ssh://root@node1/system"
+    },
+    "domains": {
+      "type": "string",
+      "description": "Comma-separated list of domain (VM) names to back up. Empty means all defined domains."
+    },
+    "consistency": {
+      "type": "string",
+      "enum": ["crash", "fsfreeze", "snapshot"],
+      "default": "fsfreeze",
+      "description": "Consistency strategy: 'crash' reads live images (crash-consistent), 'fsfreeze' quiesces the guest via qemu-guest-agent around the read (application-consistent when the agent is installed), 'snapshot' uses an atomic external disk-only snapshot."
+    },
+    "include_disks": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to include the VM disk images in the backup (in addition to the libvirt domain XML definition)."
+    }
+  }
+}

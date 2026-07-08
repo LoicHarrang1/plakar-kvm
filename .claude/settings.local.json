@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.plakar.io)",
+      "WebFetch(domain:github.com)",
+      "WebSearch"
+    ]
+  }
+}
