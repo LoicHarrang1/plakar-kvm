@@ -17,96 +17,75 @@ repository:
   On the DRBD **Primary** node these devices are read like any other block device.
 
 Following the same philosophy as the Plakar Proxmox integration (which wraps
-`vzdump`), this connector wraps the native `virsh` and `qemu-img` tools rather
-than linking the libvirt C bindings. This keeps the plugin CGO-free and avoids
-GPL/LGPL dependencies.
+`vzdump`), this connector wraps the native `virsh` tool rather than linking the
+libvirt C bindings. This keeps the plugin CGO-free and avoids GPL/LGPL
+dependencies.
+
+## Behaviour (no tunables)
+
+The connector has a single, opinionated behaviour — there is nothing to tune:
+
+- **Running domain** → **atomic external disk-only snapshot**, crash-consistent.
+  The base becomes read-only and is streamed directly (no staging copy); the
+  overlay is merged back with `blockcommit` once the read completes. No guest
+  agent is involved, so nothing can wedge it.
+- **Stopped domain** → the disk is already consistent and is read directly.
+- Disk streams are **SSH-compressed** (`-C`) in remote mode — a big win for raw
+  disks full of zeros.
+
+Local vs remote is selected automatically from the `location`:
+
+- **Local** (`kvm:///system`): the plugin runs on the KVM/DRBD node; disks are
+  read on the local filesystem / block devices.
+- **Remote** (`kvm://[user@]host/system`): Plakar runs elsewhere and does **not**
+  need to be installed on the hypervisor. libvirt control goes through
+  `qemu+ssh://`; disk data is streamed back over SSH (`ssh cat`).
 
 ## Requirements
 
-- `virsh` in `PATH` on the machine running Plakar (it reaches the hypervisor
-  locally or over `qemu+ssh://`).
-- `qemu-img` available **where the disk images live** (locally in local mode, on
-  the hypervisor in remote mode) — required by `consistency: fsfreeze`.
-- For **application-consistent** backups (`consistency: fsfreeze`), the
-  `qemu-guest-agent` must be installed and running inside the guests.
-- For DRBD-backed VMs, target the **Primary** node (block devices are only
-  readable there).
+- **Plakar host**: `virsh` (libvirt-clients) and `ssh` in `PATH`.
+- **Hypervisor**: `sshd`; the SSH user must be allowed to read the disk images /
+  block devices (usually `root` for DRBD `/dev/drbdN`). Non-interactive,
+  key-based SSH (`BatchMode`) from the Plakar host.
+- **DRBD**: target the **Primary** node (block devices are only readable there).
+- **Guest VM**: nothing.
 
-### Local vs remote mode
-
-The connector works in two modes, selected automatically from the connection URI:
-
-- **Local mode** (`kvm:///system`): the plugin runs on the KVM/DRBD node and
-  reads/converts disk images directly on the local filesystem or block devices.
-- **Remote mode** (`kvm://<host>/system`, i.e. `qemu+ssh://<host>/system`):
-  Plakar runs elsewhere (e.g. a dedicated backup server) and does **not** need to
-  be installed on the hypervisor. The libvirt control plane goes through
-  `qemu+ssh://`, and the disk **data** is read/converted on the hypervisor and
-  streamed back over SSH (`ssh cat`, remote `qemu-img convert`). This requires
-  non-interactive SSH access (key-based, `BatchMode`) from the Plakar host to the
-  hypervisor, as a user allowed to read the disk images / block devices (usually
-  `root` for DRBD devices).
+No `qemu-img` and no `qemu-guest-agent` are required.
 
 ## Configuration
 
-The configuration parameters are as follows:
+Only two keys (see [importer/schema.json](importer/schema.json)):
 
-- `location` (required): `kvm://[<host>]/(system|session)`
+- `location` (required): `kvm://[<user>@]<host>/(system|session)`
   - `kvm:///system` → `qemu:///system` (local)
-  - `kvm://node1/system` → `qemu+ssh://node1/system` (remote)
-- `connect_uri` (optional): explicit libvirt URI passed to `virsh -c`, overriding
-  the one derived from `location` (e.g. `qemu+ssh://root@node1/system`).
-- `ssh_user` (optional, remote mode): SSH user for reading disk data on the
-  hypervisor. Defaults to the user in the connection URI.
-- `ssh_port` (optional, remote mode): SSH port for reading disk data. Defaults to
-  the URI port (or 22).
+  - `kvm://FR-KVM-TEST1/system` → `qemu+ssh://FR-KVM-TEST1/system` (remote)
+  - `kvm://root@FR-KVM-TEST1/system` → remote with SSH user `root`
 - `domains` (optional): comma-separated VM names to include. Empty = all domains.
-- `consistency` (optional, default `fsfreeze`):
-  - `crash` — read live images, no coordination (crash-consistent).
-  - `fsfreeze` — quiesce the guest via qemu-guest-agent, copy each disk with
-    `qemu-img convert` to a staging file, then thaw (application-consistent, needs
-    staging space equal to the disks).
-  - `snapshot` — atomic external disk-only snapshot: the guest instantly switches
-    to a qcow2 overlay, the frozen base is streamed **directly** into Plakar (no
-    staging copy), then `blockcommit --active --pivot` merges the overlay back.
-    The guest is frozen only for the snapshot instant (with `--quiesce`). Best for
-    large disks. Works for file-backed disks and raw DRBD block devices (the
-    overlay is a file in `overlay_dir`; the DRBD device stays the frozen backing).
-- `overlay_dir` (optional, default `/var/lib/libvirt/images`): where snapshot
-  overlays are created on the hypervisor (`snapshot` mode). Must be writable by
-  the QEMU/libvirt process.
-- `include_disks` (optional, default `true`): back up disk images in addition to
-  the domain XML.
-
-Stopped domains are always read directly (they are already consistent),
-regardless of the `consistency` setting.
 
 ## Snapshot layout
 
 Each domain produces the following tree inside the Kloset snapshot:
 
 ```
-<domain>/domain.xml
-<domain>/disks/<image-basename>[.qcow2]
+/<domain>/domain.xml
+/<domain>/disks/<image-basename>
 ```
 
 ## Examples
 
 ```bash
-# LOCAL: configure a local KVM source (application-consistent)
-$ plakar source add myKVM kvm:///system consistency=fsfreeze
-
-# back up all VMs on the local hypervisor
+# LOCAL: back up all VMs on the local hypervisor
+$ plakar source add myKVM kvm:///system
 $ plakar backup @myKVM
-
-# back up only two VMs, definitions only (no disks)
-$ plakar source add webVMs kvm:///system domains=web01,web02 include_disks=false
-$ plakar backup @webVMs
 
 # REMOTE: back up VMs on a remote hypervisor over SSH (Plakar not installed there)
 # requires key-based SSH from this host to root@FR-KVM-TEST1
-$ plakar source add remoteKVM kvm://FR-KVM-TEST1/system consistency=fsfreeze
+$ plakar source add remoteKVM kvm://root@FR-KVM-TEST1/system
 $ plakar backup @remoteKVM
+
+# only specific VMs
+$ plakar source add someVMs kvm://root@FR-KVM-TEST1/system domains=web01,web02
+$ plakar backup @someVMs
 ```
 
 ## Building and installing
@@ -133,12 +112,14 @@ $ plakar pkg show
 
 Implemented:
 - Domain enumeration and XML export.
-- Disk export in `crash`, `fsfreeze` (application-consistent) and `snapshot`
-  (external disk-only snapshot, no staging copy) modes.
+- Crash-consistent disk backup via atomic external snapshot (running domains) or
+  direct read (stopped domains).
 - DRBD block devices as sources on the Primary node.
 - Local and remote (SSH) modes — Plakar need not be installed on the hypervisor.
 
 Planned:
+- Application-consistent snapshots via qemu-guest-agent quiesce (once a reliable
+  guest-agent setup is validated).
 - Incremental backups via QEMU dirty bitmaps.
 - An **exporter** (restore) counterpart to redefine domains and restore disks.
 

@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/url"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,50 +21,36 @@ func init() {
 	importer.Register("kvm", 0, NewImporter)
 }
 
-// Importer backs up KVM/libvirt domains (their XML definition and, optionally,
-// their disk images) into a Kloset repository. Disks backed by DRBD block
-// devices are supported: on the Primary node they appear as regular block
-// devices and are read like any other source.
+// Importer backs up KVM/libvirt domains — their XML definition plus their disk
+// images — into a Kloset repository.
 //
-// It works both locally (plugin running on the KVM/DRBD node) and remotely
-// (plugin running elsewhere, reaching the hypervisor over SSH); see storageAccess.
+// It has a single, opinionated behaviour (no tunables):
+//   - Running domain  -> atomic external disk-only snapshot, crash-consistent
+//     (the base becomes read-only and is streamed directly; the overlay is
+//     merged back with blockcommit once the read completes). No guest agent is
+//     involved, so nothing can wedge it.
+//   - Stopped domain  -> the disk is already consistent and is read directly.
+//
+// Works locally (plugin on the KVM/DRBD node) or remotely over SSH (plugin
+// elsewhere; libvirt control via qemu+ssh://, disk data via ssh). DRBD block
+// devices on the Primary node are read like any other source.
 type Importer struct {
 	virsh        *virsh
 	access       storageAccess
-	remote       bool
 	origin       string
-	consistency  consistencyMode
 	domainFilter map[string]bool // nil means "all domains"
-	includeDisks bool
-	overlayDir   string // where external snapshot overlays are created (snapshot mode)
 
 	sessMu   sync.Mutex
-	sessions []*snapshotSession // in-flight snapshot sessions (snapshot mode)
+	sessions []*snapshotSession // in-flight snapshot sessions
 }
 
-// NewImporter builds a KVM importer from the connector configuration. See
-// importer/schema.json for the accepted keys.
+// NewImporter builds a KVM importer from the connector configuration. Only two
+// keys are accepted (see importer/schema.json): the required "location" and the
+// optional "domains" filter.
 func NewImporter(appCtx context.Context, opts *connectors.Options, name string, config map[string]string) (importer.Importer, error) {
-	connectURI, err := resolveConnectURI(config)
+	connectURI, err := resolveConnectURI(config["location"])
 	if err != nil {
 		return nil, err
-	}
-
-	consistency, err := parseConsistency(config["consistency"])
-	if err != nil {
-		return nil, err
-	}
-
-	includeDisks := true
-	if v, ok := config["include_disks"]; ok {
-		if includeDisks, err = strconv.ParseBool(v); err != nil {
-			return nil, fmt.Errorf("invalid include_disks %q: %w", v, err)
-		}
-	}
-
-	overlayDir := strings.TrimSpace(config["overlay_dir"])
-	if overlayDir == "" {
-		overlayDir = "/var/lib/libvirt/images"
 	}
 
 	var filter map[string]bool
@@ -78,7 +63,7 @@ func NewImporter(appCtx context.Context, opts *connectors.Options, name string, 
 		}
 	}
 
-	access, remote, err := newAccess(connectURI, config)
+	access, err := newAccess(connectURI)
 	if err != nil {
 		return nil, err
 	}
@@ -93,27 +78,20 @@ func NewImporter(appCtx context.Context, opts *connectors.Options, name string, 
 	return &Importer{
 		virsh:        v,
 		access:       access,
-		remote:       remote,
 		origin:       origin,
-		consistency:  consistency,
 		domainFilter: filter,
-		includeDisks: includeDisks,
-		overlayDir:   overlayDir,
 	}, nil
 }
 
-// resolveConnectURI turns the kvm:// location (or an explicit connect_uri) into
-// a libvirt connection URI understood by virsh -c.
+// resolveConnectURI turns the kvm:// location into a libvirt connection URI
+// understood by virsh -c. The location carries everything needed, including the
+// SSH user for remote access:
 //
-//	kvm:///system          -> qemu:///system              (local)
-//	kvm:///session         -> qemu:///session             (local)
-//	kvm://node1/system     -> qemu+ssh://node1/system      (remote)
-func resolveConnectURI(config map[string]string) (string, error) {
-	if u := strings.TrimSpace(config["connect_uri"]); u != "" {
-		return u, nil
-	}
-
-	loc := strings.TrimSpace(config["location"])
+//	kvm:///system                 -> qemu:///system                 (local)
+//	kvm://host/system             -> qemu+ssh://host/system         (remote)
+//	kvm://root@host/system        -> qemu+ssh://root@host/system    (remote, user)
+func resolveConnectURI(loc string) (string, error) {
+	loc = strings.TrimSpace(loc)
 	if loc == "" {
 		return "", fmt.Errorf("missing required 'location'")
 	}
@@ -134,7 +112,12 @@ func resolveConnectURI(config map[string]string) (string, error) {
 	if parsed.Host == "" {
 		return fmt.Sprintf("qemu:///%s", transport), nil
 	}
-	return fmt.Sprintf("qemu+ssh://%s/%s", parsed.Host, transport), nil
+
+	userinfo := ""
+	if parsed.User != nil && parsed.User.Username() != "" {
+		userinfo = parsed.User.Username() + "@"
+	}
+	return fmt.Sprintf("qemu+ssh://%s%s/%s", userinfo, parsed.Host, transport), nil
 }
 
 func (p *Importer) Origin() string        { return p.origin }
@@ -185,7 +168,7 @@ func (p *Importer) forgetSession(s *snapshotSession) {
 }
 
 // Import walks the selected domains and streams one record per domain XML plus
-// (optionally) one record per disk image.
+// one record per disk image.
 func (p *Importer) Import(ctx context.Context, records chan<- *connectors.Record, results <-chan *connectors.Result) error {
 	defer close(records)
 
@@ -207,7 +190,7 @@ func (p *Importer) Import(ctx context.Context, records chan<- *connectors.Record
 }
 
 func (p *Importer) importDomain(ctx context.Context, domain string, records chan<- *connectors.Record) {
-	// 1. Domain definition (always).
+	// 1. Domain definition.
 	xmlPath := vmPath(domain, "domain.xml")
 	xml, err := p.virsh.dumpXML(ctx, domain)
 	if err != nil {
@@ -217,11 +200,7 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 	records <- connectors.NewRecord(xmlPath, "", memFileInfo("domain.xml", int64(len(xml))), nil,
 		func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(xml)), nil })
 
-	// 2. Disk images (optional).
-	if !p.includeDisks {
-		return
-	}
-
+	// 2. Disks.
 	disks, err := p.virsh.listDisks(ctx, domain)
 	if err != nil {
 		records <- connectors.NewError(vmPath(domain, "disks"), err)
@@ -234,26 +213,19 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 		return
 	}
 
-	// A stopped domain is already consistent; skip quiescing.
-	mode := p.consistency
-	if !running {
-		mode = modeCrash
-	}
-
-	switch mode {
-	case modeSnapshot:
+	if running {
+		// Consistent point-in-time via external snapshot.
 		p.importDisksSnapshot(ctx, domain, disks, records)
-	case modeFsfreeze:
-		p.importDisksFsfreeze(ctx, domain, disks, records)
-	default: // modeCrash
-		p.importDisksCrash(ctx, domain, disks, records)
+	} else {
+		// Already consistent: read the images directly.
+		p.importDisksDirect(ctx, domain, disks, records)
 	}
 }
 
-// importDisksCrash emits lazy readers straight over the live source images
-// (crash-consistent). Suitable for stopped domains or journaled guests. Works
-// locally (os.Open) or remotely (ssh cat) via the storageAccess abstraction.
-func (p *Importer) importDisksCrash(ctx context.Context, domain string, disks []diskInfo, records chan<- *connectors.Record) {
+// importDisksDirect emits lazy readers straight over the source images. Used for
+// stopped domains (already consistent). Works locally (os.Open) or remotely
+// (ssh cat) via the storageAccess abstraction.
+func (p *Importer) importDisksDirect(ctx context.Context, domain string, disks []diskInfo, records chan<- *connectors.Record) {
 	for _, d := range disks {
 		diskPath := vmPath(domain, "disks", path.Base(d.Source))
 		src := d.Source
@@ -268,50 +240,6 @@ func (p *Importer) importDisksCrash(ctx context.Context, domain string, disks []
 			// context.Background(): the read may outlive Import; the record
 			// Close (or a plakar-side abort) tears the reader down.
 			func() (io.ReadCloser, error) { return p.access.open(context.Background(), src) })
-	}
-}
-
-// importDisksFsfreeze quiesces the guest, materialises a consistent, sparse
-// qcow2 copy of every disk (via qemu-img convert, local or remote), then thaws
-// the guest. The emitted records read those temporary copies and delete them on
-// Close.
-//
-// The freeze window is kept as short as possible but does span the qemu-img
-// conversions so that all disks of a domain share a single point in time.
-func (p *Importer) importDisksFsfreeze(ctx context.Context, domain string, disks []diskInfo, records chan<- *connectors.Record) {
-	thaw := p.freeze(ctx, domain)
-
-	type staged struct {
-		path string // record path inside the snapshot
-		tmp  string // temporary qcow2 file (local path or remote path)
-	}
-	var ready []staged
-
-	for _, d := range disks {
-		tmp, err := p.access.convertToTemp(ctx, d.Source)
-		if err != nil {
-			records <- connectors.NewError(vmPath(domain, "disks", path.Base(d.Source)), err)
-			continue
-		}
-		ready = append(ready, staged{
-			path: vmPath(domain, "disks", path.Base(d.Source)+".qcow2"),
-			tmp:  tmp,
-		})
-	}
-
-	// Guest can resume as soon as the consistent copies exist.
-	thaw()
-
-	for _, s := range ready {
-		fi, err := p.access.statTemp(ctx, s.tmp)
-		if err != nil {
-			_ = p.access.removeTemp(ctx, s.tmp)
-			records <- connectors.NewError(s.path, err)
-			continue
-		}
-		tmp := s.tmp
-		records <- connectors.NewRecord(s.path, "", fi, nil,
-			func() (io.ReadCloser, error) { return p.access.openTemp(context.Background(), tmp) })
 	}
 }
 

@@ -12,16 +12,19 @@ import (
 	"github.com/PlakarKorp/kloset/connectors"
 )
 
-// importDisksSnapshot backs up disks using an atomic external disk-only snapshot
-// instead of copying the full disk while frozen.
+// overlayDir is where external snapshot overlays are created on the hypervisor.
+// It is the standard libvirt images directory, writable by the QEMU process.
+const overlayDir = "/var/lib/libvirt/images"
+
+// importDisksSnapshot backs up the disks of a running domain via an atomic
+// external disk-only snapshot — a consistent point-in-time with no staging copy.
 //
 // Lifecycle per domain:
-//  1. snapshot-create-as --disk-only --atomic --no-metadata (with --quiesce when
-//     the guest agent is available): the guest instantly switches to a fresh
-//     qcow2 overlay while every original disk becomes a read-only, frozen backing.
+//  1. snapshot-create-as --disk-only --atomic --no-metadata: the guest instantly
+//     switches to a fresh qcow2 overlay while every original disk becomes a
+//     read-only, frozen backing. Crash-consistent (no guest agent involved).
 //  2. Stream each frozen backing (the original source, file or DRBD block device)
-//     straight into Plakar — no staging copy. The guest keeps running on the
-//     overlay during the read.
+//     straight into Plakar. The guest keeps running on the overlay during the read.
 //  3. Once ALL disk readers of the domain have been consumed and closed,
 //     blockcommit --active --pivot merges each overlay back into its base and the
 //     overlay files are removed.
@@ -36,17 +39,11 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 
 	ts := time.Now().Unix()
 	snapname := fmt.Sprintf("plakar-%d", ts)
-	args, overlays, targets := buildSnapshotArgs(domain, snapname, disks, p.overlayDir, ts)
+	args, overlays, targets := buildSnapshotArgs(domain, snapname, disks, overlayDir, ts)
 
-	// Prefer an application-consistent (quiesced) snapshot; fall back to a
-	// crash-consistent one if the guest agent is unavailable.
-	quiesced := append(append([]string{}, args...), "--quiesce")
-	if _, err := p.virsh.run(ctx, quiesced...); err != nil {
-		log.Printf("[kvm] quiesced snapshot of %s failed (%v); retrying without --quiesce", domain, err)
-		if _, err := p.virsh.run(ctx, args...); err != nil {
-			records <- connectors.NewError(vmPath(domain), fmt.Errorf("snapshot-create-as: %w", err))
-			return
-		}
+	if _, err := p.virsh.run(ctx, args...); err != nil {
+		records <- connectors.NewError(vmPath(domain), fmt.Errorf("snapshot-create-as: %w", err))
+		return
 	}
 
 	sess := &snapshotSession{

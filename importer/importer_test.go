@@ -5,22 +5,22 @@ import "testing"
 func TestResolveConnectURI(t *testing.T) {
 	tests := []struct {
 		name    string
-		config  map[string]string
+		loc     string
 		want    string
 		wantErr bool
 	}{
-		{"local system", map[string]string{"location": "kvm:///system"}, "qemu:///system", false},
-		{"local session", map[string]string{"location": "kvm:///session"}, "qemu:///session", false},
-		{"remote host", map[string]string{"location": "kvm://node1/system"}, "qemu+ssh://node1/system", false},
-		{"explicit override", map[string]string{"location": "kvm:///system", "connect_uri": "qemu+ssh://root@n2/system"}, "qemu+ssh://root@n2/system", false},
-		{"missing location", map[string]string{}, "", true},
-		{"wrong scheme", map[string]string{"location": "qemu:///system"}, "", true},
-		{"bad path", map[string]string{"location": "kvm:///bogus"}, "", true},
+		{"local system", "kvm:///system", "qemu:///system", false},
+		{"local session", "kvm:///session", "qemu:///session", false},
+		{"remote host", "kvm://node1/system", "qemu+ssh://node1/system", false},
+		{"remote with user", "kvm://root@node1/system", "qemu+ssh://root@node1/system", false},
+		{"missing location", "", "", true},
+		{"wrong scheme", "qemu:///system", "", true},
+		{"bad path", "kvm:///bogus", "", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveConnectURI(tt.config)
+			got, err := resolveConnectURI(tt.loc)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("resolveConnectURI() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -71,30 +71,24 @@ func TestNewAccess(t *testing.T) {
 	tests := []struct {
 		name       string
 		connectURI string
-		config     map[string]string
 		wantRemote bool
 		wantTarget string // only checked when remote
 		wantPort   string
-		wantErr    bool
 	}{
-		{"local system", "qemu:///system", nil, false, "", "", false},
-		{"local session", "qemu:///session", nil, false, "", "", false},
-		{"remote ssh", "qemu+ssh://root@node1/system", nil, true, "root@node1", "", false},
-		{"remote no user", "qemu+ssh://node1/system", nil, true, "node1", "", false},
-		{"ssh overrides", "qemu+ssh://root@node1/system", map[string]string{"ssh_user": "backup", "ssh_port": "2222"}, true, "backup@node1", "2222", false},
-		{"remote with port in uri", "qemu+ssh://root@node1:2200/system", nil, true, "root@node1", "2200", false},
+		{"local system", "qemu:///system", false, "", ""},
+		{"local session", "qemu:///session", false, "", ""},
+		{"remote ssh", "qemu+ssh://root@node1/system", true, "root@node1", ""},
+		{"remote no user", "qemu+ssh://node1/system", true, "node1", ""},
+		{"remote with port", "qemu+ssh://root@node1:2200/system", true, "root@node1", "2200"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			acc, remote, err := newAccess(tt.connectURI, tt.config)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("newAccess() error = %v, wantErr %v", err, tt.wantErr)
+			acc, err := newAccess(tt.connectURI)
+			if err != nil {
+				t.Fatalf("newAccess() error = %v", err)
 			}
-			if remote != tt.wantRemote {
-				t.Fatalf("newAccess() remote = %v, want %v", remote, tt.wantRemote)
-			}
-			if !remote {
+			if !tt.wantRemote {
 				if _, ok := acc.(localAccess); !ok {
 					t.Fatalf("expected localAccess, got %T", acc)
 				}
@@ -198,13 +192,4 @@ func contains(ss []string, v string) bool {
 		}
 	}
 	return false
-}
-
-func TestParseConsistency(t *testing.T) {
-	if m, _ := parseConsistency(""); m != modeFsfreeze {
-		t.Errorf("default consistency = %q, want fsfreeze", m)
-	}
-	if _, err := parseConsistency("bogus"); err == nil {
-		t.Errorf("expected error for invalid consistency mode")
-	}
 }

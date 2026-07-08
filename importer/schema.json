@@ -10,51 +10,12 @@
     "location": {
       "type": "string",
       "minLength": 1,
-      "description": "KVM location URI: kvm://[<host>]/[system|session]. Examples: kvm:///system, kvm://node1/system",
+      "description": "KVM location URI: kvm://[<user>@]<host>/(system|session). Examples: kvm:///system (local), kvm://FR-KVM-TEST1/system (remote), kvm://root@FR-KVM-TEST1/system (remote with SSH user).",
       "pattern": "^kvm://[^/]*/(system|session)$"
-    },
-    "connect_uri": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Explicit libvirt connection URI passed to virsh -c (overrides the URI derived from location). Example: qemu+ssh://root@node1/system"
-    },
-    "ssh_user": {
-      "type": "string",
-      "minLength": 1,
-      "description": "SSH user for remote data access (reading/converting disk images on the hypervisor). Defaults to the user in the connection URI. Only used in remote mode."
-    },
-    "ssh_port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535,
-      "description": "SSH port for remote data access. Defaults to the port in the connection URI (or 22). Only used in remote mode."
     },
     "domains": {
       "type": "string",
       "description": "Comma-separated list of domain (VM) names to back up. Empty means all defined domains."
-    },
-    "consistency": {
-      "type": "string",
-      "enum": ["crash", "fsfreeze", "snapshot"],
-      "default": "fsfreeze",
-      "description": "Consistency strategy: 'crash' reads live images (crash-consistent); 'fsfreeze' quiesces the guest via qemu-guest-agent then copies each disk (application-consistent, needs staging space); 'snapshot' takes an atomic external disk-only snapshot and streams the frozen base directly (no staging copy, guest frozen only for the snapshot instant)."
-    },
-    "overlay_dir": {
-      "type": "string",
-      "pattern": "^/",
-      "default": "/var/lib/libvirt/images",
-      "description": "Directory (on the hypervisor) where external snapshot overlays are created in 'snapshot' mode. Must be writable by the QEMU/libvirt process."
-    },
-    "tmp_dir": {
-      "type": "string",
-      "pattern": "^/",
-      "default": "/var/tmp",
-      "description": "Directory (where the disk lives: local host or hypervisor) for the consistent qcow2 copy in 'fsfreeze' mode. Defaults to /var/tmp (disk-backed); avoid a tmpfs /tmp for large disks. Needs room for the largest disk's allocated data."
-    },
-    "include_disks": {
-      "type": "boolean",
-      "default": true,
-      "description": "Whether to include the VM disk images in the backup (in addition to the libvirt domain XML definition)."
     }
   }
 }
