@@ -22,7 +22,8 @@ const (
 
 	// modeSnapshot takes an atomic external disk-only snapshot so the base
 	// image becomes read-only and frozen while the guest keeps writing to a new
-	// overlay; after the read the overlay is committed back. See snapshotDisks.
+	// overlay; after the read the overlay is committed back. See
+	// importDisksSnapshot.
 	modeSnapshot consistencyMode = "snapshot"
 )
 
@@ -50,24 +51,4 @@ func (p *Importer) freeze(ctx context.Context, domain string) (thaw func()) {
 			log.Printf("[kvm] fsthaw %s failed: %v", domain, err)
 		}
 	}
-}
-
-// snapshotDisks creates an atomic external disk-only snapshot of the domain and
-// returns, for each target disk, the frozen base path to read plus a cleanup
-// function that commits the live overlay back into the base and pivots.
-//
-// TODO(kvm): implement the full snapshot lifecycle:
-//   - virsh snapshot-create-as <dom> plakar-<ts> \
-//       --disk-only --atomic --no-metadata \
-//       --diskspec <target>,snapshot=external,file=<overlay>
-//   - read the now-static base image for each disk
-//   - virsh blockcommit <dom> <target> --active --pivot --wait
-//     to merge the overlay back and drop it
-//
-// This is the correct path for file-backed qcow2 disks. For raw DRBD block
-// devices (/dev/drbdN) an overlay cannot live on the block device itself; the
-// recommended consistent path there is an LVM snapshot of the DRBD backing
-// volume (on the Primary node) wrapped in fsfreeze/fsthaw — tracked separately.
-func (p *Importer) snapshotDisks(ctx context.Context, domain string, disks []diskInfo) (bases map[string]string, cleanup func(), err error) {
-	return nil, nil, fmt.Errorf("consistency mode %q not yet implemented (use crash or fsfreeze for now)", modeSnapshot)
 }

@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
-	"os/exec"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PlakarKorp/kloset/connectors"
@@ -27,12 +26,21 @@ func init() {
 // their disk images) into a Kloset repository. Disks backed by DRBD block
 // devices are supported: on the Primary node they appear as regular block
 // devices and are read like any other source.
+//
+// It works both locally (plugin running on the KVM/DRBD node) and remotely
+// (plugin running elsewhere, reaching the hypervisor over SSH); see storageAccess.
 type Importer struct {
 	virsh        *virsh
+	access       storageAccess
+	remote       bool
 	origin       string
 	consistency  consistencyMode
 	domainFilter map[string]bool // nil means "all domains"
 	includeDisks bool
+	overlayDir   string // where external snapshot overlays are created (snapshot mode)
+
+	sessMu   sync.Mutex
+	sessions []*snapshotSession // in-flight snapshot sessions (snapshot mode)
 }
 
 // NewImporter builds a KVM importer from the connector configuration. See
@@ -55,6 +63,11 @@ func NewImporter(appCtx context.Context, opts *connectors.Options, name string, 
 		}
 	}
 
+	overlayDir := strings.TrimSpace(config["overlay_dir"])
+	if overlayDir == "" {
+		overlayDir = "/var/lib/libvirt/images"
+	}
+
 	var filter map[string]bool
 	if raw := strings.TrimSpace(config["domains"]); raw != "" {
 		filter = make(map[string]bool)
@@ -63,6 +76,11 @@ func NewImporter(appCtx context.Context, opts *connectors.Options, name string, 
 				filter[d] = true
 			}
 		}
+	}
+
+	access, remote, err := newAccess(connectURI, config)
+	if err != nil {
+		return nil, err
 	}
 
 	v := &virsh{connectURI: connectURI}
@@ -74,19 +92,22 @@ func NewImporter(appCtx context.Context, opts *connectors.Options, name string, 
 
 	return &Importer{
 		virsh:        v,
+		access:       access,
+		remote:       remote,
 		origin:       origin,
 		consistency:  consistency,
 		domainFilter: filter,
 		includeDisks: includeDisks,
+		overlayDir:   overlayDir,
 	}, nil
 }
 
 // resolveConnectURI turns the kvm:// location (or an explicit connect_uri) into
 // a libvirt connection URI understood by virsh -c.
 //
-//	kvm:///system          -> qemu:///system
-//	kvm:///session         -> qemu:///session
-//	kvm://node1/system     -> qemu+ssh://node1/system
+//	kvm:///system          -> qemu:///system              (local)
+//	kvm:///session         -> qemu:///session             (local)
+//	kvm://node1/system     -> qemu+ssh://node1/system      (remote)
 func resolveConnectURI(config map[string]string) (string, error) {
 	if u := strings.TrimSpace(config["connect_uri"]); u != "" {
 		return u, nil
@@ -125,8 +146,42 @@ func (p *Importer) Ping(ctx context.Context) error {
 	return p.virsh.ping(ctx)
 }
 
+// Close is a safety net: if any snapshot session still has outstanding readers
+// (e.g. a disk was never read), commit and clean it up so overlays don't linger.
 func (p *Importer) Close(ctx context.Context) error {
+	p.sessMu.Lock()
+	pending := append([]*snapshotSession{}, p.sessions...)
+	p.sessMu.Unlock()
+
+	for _, s := range pending {
+		s.mu.Lock()
+		already := s.done
+		if !already {
+			s.done = true
+		}
+		s.mu.Unlock()
+		if !already {
+			s.commit()
+		}
+	}
 	return nil
+}
+
+func (p *Importer) rememberSession(s *snapshotSession) {
+	p.sessMu.Lock()
+	p.sessions = append(p.sessions, s)
+	p.sessMu.Unlock()
+}
+
+func (p *Importer) forgetSession(s *snapshotSession) {
+	p.sessMu.Lock()
+	defer p.sessMu.Unlock()
+	for i, x := range p.sessions {
+		if x == s {
+			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
+			break
+		}
+	}
 }
 
 // Import walks the selected domains and streams one record per domain XML plus
@@ -187,13 +242,7 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 
 	switch mode {
 	case modeSnapshot:
-		bases, cleanup, err := p.snapshotDisks(ctx, domain, disks)
-		if err != nil {
-			records <- connectors.NewError(domain, err)
-			return
-		}
-		defer cleanup()
-		_ = bases // TODO(kvm): emit lazy readers over the frozen base images
+		p.importDisksSnapshot(ctx, domain, disks, records)
 	case modeFsfreeze:
 		p.importDisksFsfreeze(ctx, domain, disks, records)
 	default: // modeCrash
@@ -202,27 +251,30 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 }
 
 // importDisksCrash emits lazy readers straight over the live source images
-// (crash-consistent). Suitable for stopped domains or journaled guests.
+// (crash-consistent). Suitable for stopped domains or journaled guests. Works
+// locally (os.Open) or remotely (ssh cat) via the storageAccess abstraction.
 func (p *Importer) importDisksCrash(ctx context.Context, domain string, disks []diskInfo, records chan<- *connectors.Record) {
 	for _, d := range disks {
 		diskPath := path.Join(domain, "disks", path.Base(d.Source))
 		src := d.Source
 
-		info, err := os.Stat(src)
+		fi, err := p.access.stat(ctx, src)
 		if err != nil {
 			records <- connectors.NewError(diskPath, err)
 			continue
 		}
-		fi := objects.FileInfoFromStat(info)
 
 		records <- connectors.NewRecord(diskPath, "", fi, nil,
-			func() (io.ReadCloser, error) { return os.Open(src) })
+			// context.Background(): the read may outlive Import; the record
+			// Close (or a plakar-side abort) tears the reader down.
+			func() (io.ReadCloser, error) { return p.access.open(context.Background(), src) })
 	}
 }
 
 // importDisksFsfreeze quiesces the guest, materialises a consistent, sparse
-// qcow2 copy of every disk (via qemu-img convert), then thaws the guest. The
-// emitted records read those temporary copies and delete them on Close.
+// qcow2 copy of every disk (via qemu-img convert, local or remote), then thaws
+// the guest. The emitted records read those temporary copies and delete them on
+// Close.
 //
 // The freeze window is kept as short as possible but does span the qemu-img
 // conversions so that all disks of a domain share a single point in time.
@@ -231,30 +283,19 @@ func (p *Importer) importDisksFsfreeze(ctx context.Context, domain string, disks
 
 	type staged struct {
 		path string // record path inside the snapshot
-		tmp  string // temporary qcow2 file on disk
+		tmp  string // temporary qcow2 file (local path or remote path)
 	}
 	var ready []staged
 
 	for _, d := range disks {
-		tmp, err := os.CreateTemp("", "plakar-kvm-*.qcow2")
+		tmp, err := p.access.convertToTemp(ctx, d.Source)
 		if err != nil {
 			records <- connectors.NewError(path.Join(domain, "disks", path.Base(d.Source)), err)
 			continue
 		}
-		tmp.Close()
-
-		// qemu-img convert produces a compact, self-contained qcow2 while the
-		// guest filesystems are frozen -> application-consistent image.
-		cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-O", "qcow2", d.Source, tmp.Name())
-		if out, err := cmd.CombinedOutput(); err != nil {
-			os.Remove(tmp.Name())
-			records <- connectors.NewError(path.Join(domain, "disks", path.Base(d.Source)),
-				fmt.Errorf("qemu-img convert: %w: %s", err, strings.TrimSpace(string(out))))
-			continue
-		}
 		ready = append(ready, staged{
 			path: path.Join(domain, "disks", path.Base(d.Source)+".qcow2"),
-			tmp:  tmp.Name(),
+			tmp:  tmp,
 		})
 	}
 
@@ -262,41 +303,19 @@ func (p *Importer) importDisksFsfreeze(ctx context.Context, domain string, disks
 	thaw()
 
 	for _, s := range ready {
-		info, err := os.Stat(s.tmp)
+		fi, err := p.access.statTemp(ctx, s.tmp)
 		if err != nil {
-			os.Remove(s.tmp)
+			_ = p.access.removeTemp(ctx, s.tmp)
 			records <- connectors.NewError(s.path, err)
 			continue
 		}
-		fi := objects.FileInfoFromStat(info)
-		tmpPath := s.tmp
+		tmp := s.tmp
 		records <- connectors.NewRecord(s.path, "", fi, nil,
-			func() (io.ReadCloser, error) { return newTempFileReader(tmpPath) })
+			func() (io.ReadCloser, error) { return p.access.openTemp(context.Background(), tmp) })
 	}
 }
 
 // memFileInfo builds a FileInfo for in-memory content (e.g. the domain XML).
 func memFileInfo(name string, size int64) objects.FileInfo {
 	return objects.NewFileInfo(name, size, 0o644, time.Now(), 0, 0, 0, 0, 1)
-}
-
-// tempFileReader reads a temporary file and removes it once closed, so staged
-// disk copies do not accumulate on disk after ingestion.
-type tempFileReader struct{ f *os.File }
-
-func newTempFileReader(name string) (io.ReadCloser, error) {
-	f, err := os.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	return &tempFileReader{f: f}, nil
-}
-
-func (r *tempFileReader) Read(p []byte) (int, error) { return r.f.Read(p) }
-
-func (r *tempFileReader) Close() error {
-	name := r.f.Name()
-	err := r.f.Close()
-	os.Remove(name)
-	return err
 }
