@@ -128,6 +128,27 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+func TestVMPath(t *testing.T) {
+	cases := map[string]string{
+		"":     "/",
+		"a":    "/a",
+		"a/b":  "/a/b",
+		"a//b": "/a/b",
+	}
+	// vmPath must always return an absolute path rooted at "/".
+	if got := vmPath("web01", "domain.xml"); got != "/web01/domain.xml" {
+		t.Errorf("vmPath(web01, domain.xml) = %q, want /web01/domain.xml", got)
+	}
+	if got := vmPath("web01", "disks", "vda"); got != "/web01/disks/vda" {
+		t.Errorf("vmPath(web01, disks, vda) = %q, want /web01/disks/vda", got)
+	}
+	for in, want := range cases {
+		if got := vmPath(in); got != want {
+			t.Errorf("vmPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestBuildSnapshotArgs(t *testing.T) {
 	disks := []diskInfo{
 		{DevType: "file", Device: "disk", Target: "vda", Source: "/var/lib/libvirt/images/vm.qcow2"},

@@ -44,7 +44,7 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 	if _, err := p.virsh.run(ctx, quiesced...); err != nil {
 		log.Printf("[kvm] quiesced snapshot of %s failed (%v); retrying without --quiesce", domain, err)
 		if _, err := p.virsh.run(ctx, args...); err != nil {
-			records <- connectors.NewError(domain, fmt.Errorf("snapshot-create-as: %w", err))
+			records <- connectors.NewError(vmPath(domain), fmt.Errorf("snapshot-create-as: %w", err))
 			return
 		}
 	}
@@ -60,7 +60,7 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 
 	for i := range disks {
 		d := disks[i]
-		diskPath := path.Join(domain, "disks", path.Base(d.Source))
+		diskPath := vmPath(domain, "disks", path.Base(d.Source))
 		base := d.Source // now a read-only, frozen backing
 
 		// Each disk releases the session exactly once, whatever happens.

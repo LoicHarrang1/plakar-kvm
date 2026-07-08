@@ -208,7 +208,7 @@ func (p *Importer) Import(ctx context.Context, records chan<- *connectors.Record
 
 func (p *Importer) importDomain(ctx context.Context, domain string, records chan<- *connectors.Record) {
 	// 1. Domain definition (always).
-	xmlPath := path.Join(domain, "domain.xml")
+	xmlPath := vmPath(domain, "domain.xml")
 	xml, err := p.virsh.dumpXML(ctx, domain)
 	if err != nil {
 		records <- connectors.NewError(xmlPath, err)
@@ -224,13 +224,13 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 
 	disks, err := p.virsh.listDisks(ctx, domain)
 	if err != nil {
-		records <- connectors.NewError(path.Join(domain, "disks"), err)
+		records <- connectors.NewError(vmPath(domain, "disks"), err)
 		return
 	}
 
 	running, err := p.virsh.isRunning(ctx, domain)
 	if err != nil {
-		records <- connectors.NewError(domain, err)
+		records <- connectors.NewError(vmPath(domain), err)
 		return
 	}
 
@@ -255,7 +255,7 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 // locally (os.Open) or remotely (ssh cat) via the storageAccess abstraction.
 func (p *Importer) importDisksCrash(ctx context.Context, domain string, disks []diskInfo, records chan<- *connectors.Record) {
 	for _, d := range disks {
-		diskPath := path.Join(domain, "disks", path.Base(d.Source))
+		diskPath := vmPath(domain, "disks", path.Base(d.Source))
 		src := d.Source
 
 		fi, err := p.access.stat(ctx, src)
@@ -290,11 +290,11 @@ func (p *Importer) importDisksFsfreeze(ctx context.Context, domain string, disks
 	for _, d := range disks {
 		tmp, err := p.access.convertToTemp(ctx, d.Source)
 		if err != nil {
-			records <- connectors.NewError(path.Join(domain, "disks", path.Base(d.Source)), err)
+			records <- connectors.NewError(vmPath(domain, "disks", path.Base(d.Source)), err)
 			continue
 		}
 		ready = append(ready, staged{
-			path: path.Join(domain, "disks", path.Base(d.Source)+".qcow2"),
+			path: vmPath(domain, "disks", path.Base(d.Source)+".qcow2"),
 			tmp:  tmp,
 		})
 	}
@@ -318,4 +318,11 @@ func (p *Importer) importDisksFsfreeze(ctx context.Context, domain string, disks
 // memFileInfo builds a FileInfo for in-memory content (e.g. the domain XML).
 func memFileInfo(name string, size int64) objects.FileInfo {
 	return objects.NewFileInfo(name, size, 0o644, time.Now(), 0, 0, 0, 0, 1)
+}
+
+// vmPath builds an absolute snapshot path (under Root() == "/"). Record paths
+// must be absolute and rooted at the importer's Root(), otherwise Plakar stores
+// the objects but does not attach them to the browsable tree.
+func vmPath(elem ...string) string {
+	return path.Join(append([]string{"/"}, elem...)...)
 }
