@@ -45,6 +45,12 @@
       "default": "/var/lib/libvirt/images",
       "description": "Directory (on the hypervisor) where external snapshot overlays are created in 'snapshot' mode. Must be writable by the QEMU/libvirt process."
     },
+    "tmp_dir": {
+      "type": "string",
+      "pattern": "^/",
+      "default": "/var/tmp",
+      "description": "Directory (where the disk lives: local host or hypervisor) for the consistent qcow2 copy in 'fsfreeze' mode. Defaults to /var/tmp (disk-backed); avoid a tmpfs /tmp for large disks. Needs room for the largest disk's allocated data."
+    },
     "include_disks": {
       "type": "boolean",
       "default": true,

@@ -49,9 +49,17 @@ func newAccess(connectURI string, config map[string]string) (storageAccess, bool
 		return nil, false, fmt.Errorf("parsing connect URI %q: %w", connectURI, err)
 	}
 
+	// Temp dir for consistent copies (fsfreeze mode). Default to /var/tmp, which
+	// is disk-backed on all distros — /tmp is often tmpfs (RAM) and would blow up
+	// on large disk images.
+	tmpDir := strings.TrimSpace(config["tmp_dir"])
+	if tmpDir == "" {
+		tmpDir = "/var/tmp"
+	}
+
 	remote := strings.Contains(u.Scheme, "ssh") || (u.Hostname() != "" && !isLocalHost(u.Hostname()))
 	if !remote {
-		return localAccess{}, false, nil
+		return localAccess{tmpDir: tmpDir}, false, nil
 	}
 
 	host := u.Hostname()
@@ -72,7 +80,7 @@ func newAccess(connectURI string, config map[string]string) (storageAccess, bool
 	if user != "" {
 		target = user + "@" + host
 	}
-	return sshAccess{target: target, port: port}, true, nil
+	return sshAccess{target: target, port: port, tmpDir: tmpDir}, true, nil
 }
 
 func isLocalHost(host string) bool {
@@ -85,7 +93,7 @@ func isLocalHost(host string) bool {
 
 // --- local access -----------------------------------------------------------
 
-type localAccess struct{}
+type localAccess struct{ tmpDir string }
 
 func (localAccess) stat(ctx context.Context, src string) (objects.FileInfo, error) {
 	info, err := os.Stat(src)
@@ -106,8 +114,8 @@ func (localAccess) open(ctx context.Context, src string) (io.ReadCloser, error) 
 	return os.Open(src)
 }
 
-func (localAccess) convertToTemp(ctx context.Context, src string) (string, error) {
-	tmp, err := os.CreateTemp("", "plakar-kvm-*.qcow2")
+func (la localAccess) convertToTemp(ctx context.Context, src string) (string, error) {
+	tmp, err := os.CreateTemp(la.tmpDir, "plakar-kvm-*.qcow2")
 	if err != nil {
 		return "", err
 	}
@@ -169,10 +177,12 @@ func (r *deletingFileReader) Close() error {
 type sshAccess struct {
 	target string // [user@]host
 	port   string // optional
+	tmpDir string // remote dir for consistent copies (fsfreeze mode)
 }
 
 func (s sshAccess) sshArgs(remoteCmd string) []string {
-	args := []string{"-o", "BatchMode=yes"}
+	// -C compresses the stream: a big win for raw disks full of zeros.
+	args := []string{"-o", "BatchMode=yes", "-C"}
 	if s.port != "" {
 		args = append(args, "-p", s.port)
 	}
@@ -245,9 +255,10 @@ func (s sshAccess) open(ctx context.Context, src string) (io.ReadCloser, error) 
 
 func (s sshAccess) convertToTemp(ctx context.Context, src string) (string, error) {
 	// mktemp + qemu-img convert on the remote host; echo the temp path back.
+	// -p <tmpDir> keeps the (potentially large) copy off a tmpfs /tmp.
 	remote := fmt.Sprintf(
-		`tmp=$(mktemp --suffix=.qcow2) && qemu-img convert -O qcow2 -- %s "$tmp" && printf %%s "$tmp"`,
-		shellQuote(src),
+		`tmp=$(mktemp -p %s --suffix=.qcow2) && qemu-img convert -O qcow2 -- %s "$tmp" && printf %%s "$tmp"`,
+		shellQuote(s.tmpDir), shellQuote(src),
 	)
 	out, err := s.runOut(ctx, remote)
 	if err != nil {
