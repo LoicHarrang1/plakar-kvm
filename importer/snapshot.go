@@ -47,7 +47,6 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 	// Safe: these are the paths we are about to create, and the guest is back on
 	// its base disk (recoverOrphanOverlays ran first).
 	for _, o := range overlays {
-		log.Printf("[kvm] pre-snapshot cleanup of target overlay path: %s", o)
 		_ = p.access.removeTemp(ctx, o)
 	}
 

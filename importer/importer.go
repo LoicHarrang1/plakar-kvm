@@ -120,10 +120,15 @@ func resolveConnectURI(loc string) (string, error) {
 	return fmt.Sprintf("qemu+ssh://%s%s/%s", userinfo, parsed.Host, transport), nil
 }
 
-func (p *Importer) Origin() string        { return p.origin }
-func (p *Importer) Type() string          { return "kvm" }
-func (p *Importer) Root() string          { return "/" }
-func (p *Importer) Flags() location.Flags { return 0 }
+func (p *Importer) Origin() string { return p.origin }
+func (p *Importer) Type() string   { return "kvm" }
+func (p *Importer) Root() string   { return "/" }
+
+// Flags declares this importer as a STREAM source (like the Proxmox integration):
+// it produces data in a single pass with side effects (snapshots), and must NOT
+// be scanned/read twice. Without FLAG_STREAM, Plakar does a separate scan pass,
+// which would run snapshot-create-as twice and collide on the overlay.
+func (p *Importer) Flags() location.Flags { return location.FLAG_STREAM }
 
 func (p *Importer) Ping(ctx context.Context) error {
 	return p.virsh.ping(ctx)
