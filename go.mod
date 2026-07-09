@@ -1,4 +1,4 @@
-module github.com/PlakarKorp/integration-kvm
+module github.com/LoicHarrang1/plakar-kvm
 
 go 1.24.0
 

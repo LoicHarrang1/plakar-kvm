@@ -4,7 +4,7 @@ import (
 	"os"
 
 	sdk "github.com/PlakarKorp/go-kloset-sdk"
-	"github.com/PlakarKorp/integration-kvm/exporter"
+	"github.com/LoicHarrang1/plakar-kvm/exporter"
 )
 
 func main() {
