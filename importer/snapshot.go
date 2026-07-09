@@ -55,11 +55,20 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 		return
 	}
 
+	// Capture each disk's original base (pre-snapshot source), aligned with
+	// targets, so blockcommit can be told the base explicitly — libvirt can't
+	// auto-detect a raw block-device base (e.g. DRBD) in the chain.
+	bases := make([]string, len(disks))
+	for i := range disks {
+		bases[i] = disks[i].Source
+	}
+
 	sess := &snapshotSession{
 		imp:       p,
 		domain:    domain,
 		targets:   targets,
 		overlays:  overlays,
+		bases:     bases,
 		remaining: len(disks),
 	}
 	p.rememberSession(sess)
@@ -152,6 +161,7 @@ type snapshotSession struct {
 	domain   string
 	targets  []string
 	overlays []string
+	bases    []string // original disk source per target (blockcommit --base)
 
 	mu        sync.Mutex
 	remaining int
@@ -185,7 +195,15 @@ func (s *snapshotSession) commit() {
 	ctx := context.Background()
 	for i, t := range s.targets {
 		overlay := s.overlays[i]
-		if _, err := s.imp.virsh.run(ctx, "blockcommit", s.domain, t, "--active", "--pivot", "--wait"); err != nil {
+
+		// Tell blockcommit the base explicitly: libvirt can't auto-detect a raw
+		// block-device base (DRBD) in the chain ("could not find base image").
+		args := []string{"blockcommit", s.domain, t, "--active", "--pivot", "--wait"}
+		if i < len(s.bases) && s.bases[i] != "" {
+			args = append(args, "--base", s.bases[i])
+		}
+
+		if _, err := s.imp.virsh.run(ctx, args...); err != nil {
 			log.Printf("[kvm] blockcommit %s/%s failed: %v — keeping overlay %s (guest may still use it)", s.domain, t, err, overlay)
 			continue
 		}
