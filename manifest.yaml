@@ -1,21 +1,19 @@
 name: kvm
 display_name: KVM / DRBD
-description: Integration providing backup and restore capabilities for KVM (libvirt) virtual machines, including those stored on DRBD block devices.
+description: Backup and restore of KVM (libvirt) virtual machines, including disks on DRBD block devices, locally or over SSH.
+version: v0.3.0
+homepage: https://gitea.roullier.net/SysTeam/plakar-kvm
+license: ISC
+tags: [backup, restore, virtualization, kvm, libvirt, drbd]
 api_version: v1.1.0
-tier: community
-contact: mailto:loic.harrang@roullier.com
 connectors:
 - type: importer
   executable: kvmImporter
-  homepage: https://github.com/PlakarKorp/integration-kvm
-  license: ISC
   protocols: [kvm]
   validator: ./importer/schema.json
   class: compute
 - type: exporter
   executable: kvmExporter
-  homepage: https://github.com/PlakarKorp/integration-kvm
-  license: ISC
   protocols: [kvm]
   validator: ./exporter/schema.json
   class: compute
