@@ -68,8 +68,13 @@ Each domain produces the following tree inside the Kloset snapshot:
 
 ```
 /<domain>/domain.xml
+/<domain>/nvram/<vars-file>      # UEFI VMs only (Windows, UEFI Linux)
 /<domain>/disks/<image-basename>
 ```
+
+For UEFI domains (their XML declares `<os><nvram>`), the NVRAM variables file is
+captured too, so the restored VM keeps its boot configuration. BIOS domains have
+no `nvram/` entry. This is driven by the firmware type, not the guest OS.
 
 ## Examples
 

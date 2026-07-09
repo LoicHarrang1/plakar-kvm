@@ -200,6 +200,20 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 	records <- connectors.NewRecord(xmlPath, "", memFileInfo("domain.xml", int64(len(xml))), nil,
 		func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(xml)), nil })
 
+	// 1b. UEFI NVRAM vars file, when the domain declares one (UEFI VMs — Windows
+	// and UEFI Linux alike). Needed for the restored VM to boot. Driven purely by
+	// <os><nvram> in the XML, not by the guest OS.
+	if nv := nvramPath(xml); nv != "" {
+		nvramRecord := vmPath(domain, "nvram", path.Base(nv))
+		if fi, err := p.access.stat(ctx, nv); err != nil {
+			records <- connectors.NewError(nvramRecord, err)
+		} else {
+			src := nv
+			records <- connectors.NewRecord(nvramRecord, "", fi, nil,
+				func() (io.ReadCloser, error) { return p.access.open(context.Background(), src) })
+		}
+	}
+
 	// 2. Disks.
 	disks, err := p.virsh.listDisks(ctx, domain)
 	if err != nil {

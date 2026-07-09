@@ -122,6 +122,29 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+func TestNvramPath(t *testing.T) {
+	uefi := []byte(`<domain type='kvm'>
+  <name>win11</name>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader>
+    <nvram template='/usr/share/OVMF/OVMF_VARS.fd'>/var/lib/libvirt/qemu/nvram/win11_VARS.fd</nvram>
+  </os>
+</domain>`)
+	if got := nvramPath(uefi); got != "/var/lib/libvirt/qemu/nvram/win11_VARS.fd" {
+		t.Errorf("nvramPath(uefi) = %q, want the vars file path", got)
+	}
+
+	bios := []byte(`<domain type='kvm'><name>lin</name><os><type>hvm</type><boot dev='hd'/></os></domain>`)
+	if got := nvramPath(bios); got != "" {
+		t.Errorf("nvramPath(bios) = %q, want empty (no NVRAM)", got)
+	}
+
+	if got := nvramPath([]byte("not xml")); got != "" {
+		t.Errorf("nvramPath(garbage) = %q, want empty", got)
+	}
+}
+
 func TestVMPath(t *testing.T) {
 	cases := map[string]string{
 		"":     "/",

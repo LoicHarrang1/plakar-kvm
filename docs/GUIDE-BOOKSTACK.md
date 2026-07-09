@@ -180,6 +180,40 @@ Arborescence d'un snapshot :
 /<vm>/disks/<nom-du-disque>
 ```
 
+### 6.4 Cas d'une VM Windows
+
+La sauvegarde d'une VM **Windows** se fait **exactement comme une VM Linux** —
+aucune commande spécifique, le plugin travaille au niveau **bloc** (contenu des
+disques) indépendamment de l'OS invité :
+
+```bash
+plakar source add winSrv kvm://root@<hyperviseur>/system domains=<vm-windows>
+plakar at /var/backups/kvm backup @winSrv
+```
+
+Deux points **spécifiques à Windows** à connaître :
+
+- **Cohérence crash-consistent.** Le disque est capturé comme après une coupure
+  de courant. NTFS **rejoue son journal** au démarrage et repart proprement — OK
+  pour un serveur de fichiers, un poste, etc. Pour des applications
+  transactionnelles (SQL Server, Exchange, Active Directory), la cohérence
+  **applicative** exigerait **VSS** (via le qemu-guest-agent Windows / virtio-win)
+  — **non pris en charge** par le plugin. Complétez alors par un dump applicatif
+  (sauvegarde SQL, etc.).
+
+- **UEFI / NVRAM : capturé ✅.** Les VM Windows (surtout Win10/11) sont quasi
+  toujours en **UEFI (OVMF)**, avec un fichier **NVRAM** de variables de démarrage.
+  Le plugin le détecte (via `<os><nvram>` dans le `domain.xml`) et le sauvegarde
+  sous `/<vm>/nvram/<fichier>` — la VM restaurée **conserve sa config de boot**.
+  (Vrai aussi pour une VM Linux en UEFI : c'est le firmware qui compte, pas l'OS.)
+- **⚠️ TPM émulé (swtpm) : non capturé.** Si la VM utilise un **TPM** (fréquent
+  sur Win11), son **état** n'est pas sauvegardé. Conséquence : si **BitLocker**
+  est scellé au TPM, la restauration demandera la **clé de récupération**.
+
+> **Recommandation :** pour un serveur Windows en TPM/BitLocker, conservez à part
+> la **clé de récupération BitLocker**. La capture de l'état TPM est prévue (voir
+> Limitations).
+
 ---
 
 ## 7. Restaurer
@@ -210,8 +244,11 @@ Sur l'hyperviseur, deux options :
 **Option A — démarrer depuis le fichier restauré** (test / DR rapide) :
 ```bash
 cd /var/lib/libvirt/images/plakar-restore/<vm>
-# éditer domain.xml : renommer la VM, pointer <disk><source> vers disks/<nom>,
-# retirer les balises <uuid> et <mac> pour éviter les conflits
+# éditer domain.xml :
+#  - renommer la VM, retirer <uuid> et <mac> pour éviter les conflits
+#  - pointer <disk><source> vers disks/<nom>
+#  - VM UEFI : pointer <nvram> vers nvram/<fichier> (ou recopier ce fichier
+#    dans /var/lib/libvirt/qemu/nvram/) pour conserver la config de boot
 virsh define domain.xml
 virsh start <vm>
 ```
@@ -239,6 +276,10 @@ qemu-img convert -O raw disks/<nom> /dev/<volume-de-test>
 - **Cohérence crash-consistent** uniquement (pas de quiesce applicatif). Adapté
   aux FS journalisés et à la plupart des charges. Les bases de données très
   sensibles peuvent nécessiter un dump applicatif complémentaire.
+- **État TPM (swtpm) non capturé** (impacte surtout Win11 avec TPM) : le
+  `domain.xml`, le **NVRAM UEFI** et les disques sont sauvegardés, mais **pas**
+  l'état du TPM émulé. Une VM avec **BitLocker** scellé au TPM demandera sa **clé
+  de récupération** à la restauration. *(Capture de l'état TPM prévue — roadmap.)*
 - **Restauration semi-automatique** : les fichiers sont restaurés, la
   redéfinition de la VM est manuelle (par sécurité).
 
@@ -307,5 +348,71 @@ plakar pkg add ./kvm_vX.Y.Z_linux_amd64.ptar
 
 ---
 
-*Dépôt du plugin : `gitea.roullier.net/SysTeam/plakar-kvm`. Contact :
+## 12. Poste Windows
+
+> **À savoir :** le plugin s'exécute sur l'**hôte Plakar** et a besoin de `virsh`
+> (client libvirt), qui **n'existe pas nativement sous Windows**. La voie propre
+> sous Windows est donc **WSL2**. Windows natif sert au **build** et à la gestion
+> des **clés SSH** / **git**, pas à exécuter le plugin.
+
+### 12.1 Voie recommandée — WSL2 (Debian/Ubuntu)
+
+Dans WSL2 on retrouve tout le toolchain Linux (`virsh`, `ssh`, `go`, `plakar`),
+donc **toutes les instructions Linux de ce guide (chapitres 3 à 7) s'appliquent
+telles quelles** à l'intérieur de WSL.
+
+```powershell
+# PowerShell (administrateur) — installer WSL2 + Debian
+wsl --install -d Debian
+```
+Puis, dans le terminal WSL :
+```bash
+sudo apt-get update
+sudo apt-get install -y libvirt-clients openssh-client
+# + installer plakar dans WSL, puis suivre les chapitres 4 à 7
+```
+
+### 12.2 Windows natif — clés SSH (client OpenSSH intégré)
+
+Windows 10/11 fournit `ssh` et `ssh-keygen`, mais **pas** `ssh-copy-id` : on copie
+la clé à la main.
+
+```powershell
+# générer une clé (si besoin)
+ssh-keygen -t ed25519
+
+# copier la clé publique vers l'hyperviseur
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh root@<hyperviseur> "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+
+# test : doit réussir SANS mot de passe
+ssh -o BatchMode=yes root@<hyperviseur> "virsh version"
+```
+
+### 12.3 Windows natif — compiler le plugin (cross-compilation vers Linux)
+
+Les binaires du plugin ciblent **Linux** (ils tournent sur l'hôte Plakar). Depuis
+Windows on cross-compile :
+
+```powershell
+# PowerShell — dans le dossier du dépôt
+$env:GOOS = "linux"; $env:GOARCH = "amd64"
+go build -o kvmImporter ./plugin/importer
+go build -o kvmExporter ./plugin/exporter
+```
+
+> Le **packaging** (`plakar pkg create`) et l'**installation** (`plakar pkg add`)
+> se font sur l'**hôte Plakar Linux** (ou dans WSL2), là où le plugin s'exécute.
+> Windows natif reste un poste de **build / git / PR**.
+
+### 12.4 Windows natif — git / contribution
+
+Git for Windows (Git Bash ou PowerShell) fonctionne normalement pour cloner,
+committer et pousser vers le dépôt (voir la procédure de contribution / PR).
+
+> Résumé : **exécuter le plugin → Linux ou WSL2** ; **builder / gérer les clés /
+> git → Windows natif possible**.
+
+---
+
+*Dépôt du plugin : `github.com/LoicHarrang1/plakar-kvm`. Contact :
 loic.harrang@roullier.com.*
