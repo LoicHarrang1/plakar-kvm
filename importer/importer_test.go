@@ -123,20 +123,27 @@ func TestShellQuote(t *testing.T) {
 }
 
 func TestIsPlakarOverlay(t *testing.T) {
-	cases := map[string]bool{
-		"/var/lib/libvirt/images/test-plakar-win-sda-plakar-1783589672.qcow2": true,
-		"/var/lib/libvirt/images/win-vda-plakar-1700000000.qcow2":             true,
-		"/var/lib/libvirt/images/win.qcow2":                                   false,
-		"/dev/drbd/by-res/vgkvm-sas-lv-win/0":                                 false,
-		"/var/lib/libvirt/images/other-vm-vda-plakar-1.qcow2":                 false, // different domain
+	// For domain "win", only "win-<target>-plakar-<ts>.qcow2" belongs to it.
+	winCases := map[string]bool{
+		"/var/lib/libvirt/images/win-vda-plakar-1700000000.qcow2": true,
+		"/var/lib/libvirt/images/win-sda-plakar-1783589672.qcow2": true,
+		"/var/lib/libvirt/images/win.qcow2":                       false, // the base disk
+		"/dev/drbd/by-res/vgkvm-sas-lv-win/0":                     false, // DRBD base
+		"/var/lib/libvirt/images/other-vda-plakar-1.qcow2":        false, // another domain
 	}
-	for src, want := range cases {
+	for src, want := range winCases {
 		if got := isPlakarOverlay("win", src); got != want {
 			t.Errorf("isPlakarOverlay(win, %q) = %v, want %v", src, got, want)
 		}
 	}
+
+	// The exact incident overlay, tested with its real domain.
 	if !isPlakarOverlay("test-plakar-win", "/var/lib/libvirt/images/test-plakar-win-sda-plakar-1783589672.qcow2") {
-		t.Errorf("should detect the incident overlay")
+		t.Errorf("should detect the incident overlay for domain test-plakar-win")
+	}
+	// ...and it must NOT match a different domain.
+	if isPlakarOverlay("win", "/var/lib/libvirt/images/test-plakar-win-sda-plakar-1783589672.qcow2") {
+		t.Errorf("overlay of test-plakar-win must not match domain win")
 	}
 }
 
