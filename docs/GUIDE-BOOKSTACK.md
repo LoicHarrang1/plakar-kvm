@@ -1,0 +1,311 @@
+# Plugin Plakar KVM / DRBD — Guide d'exploitation
+
+> **Comment importer dans BookStack** : crée un *Livre* « Plakar KVM/DRBD », puis
+> une page par chapitre (les titres `##` ci-dessous). Ou colle tout dans une seule
+> page via l'éditeur Markdown de BookStack (Édition → Markdown). Le contenu utilise
+> du Markdown standard (titres, tableaux, blocs de code, citations).
+
+Ce plugin permet à **Plakar** de sauvegarder et restaurer des machines virtuelles
+**KVM/libvirt**, y compris quand leurs disques sont des **volumes DRBD** (block
+devices `/dev/drbd…`). Il fonctionne **à distance par SSH** : Plakar n'a pas
+besoin d'être installé sur l'hyperviseur.
+
+---
+
+## 1. Ce que fait le plugin
+
+- **Sauvegarde** (connecteur *importer*) : la définition de chaque VM (`domain.xml`)
+  + le contenu de ses disques, dans un dépôt Kloset chiffré et dédupliqué.
+- **Restauration** (connecteur *exporter*) : redépose les fichiers d'une sauvegarde
+  (définition + images disque) sur l'hyperviseur, dans un répertoire dédié.
+
+**Comportement unique, sans réglage :**
+
+| Situation | Comportement |
+|-----------|--------------|
+| VM **allumée** | Snapshot externe atomique, **crash-consistent** (lecture de la base figée, puis fusion de l'overlay). Aucun agent invité requis. |
+| VM **éteinte** | Lecture directe du disque (déjà cohérent). |
+| Transport distant | Contrôle libvirt via `qemu+ssh://`, données disque via SSH (compressé). |
+
+> **Note :** « crash-consistent » = équivalent à une coupure de courant. Un système
+> de fichiers journalisé (ext4, XFS…) rejoue son journal au démarrage et repart
+> proprement. C'est le niveau de cohérence standard pour ce type de sauvegarde.
+
+---
+
+## 2. Architecture
+
+```
++------------------+        SSH (contrôle virsh + données disque)      +-------------------+
+|  Hôte Plakar     |  ----------------------------------------------> |   Hyperviseur     |
+|  (ex: plakar-srv)|     qemu+ssh:// , ssh cat                         |   KVM + DRBD      |
+|  - plakar        |                                                   |   (nœud Primary)  |
+|  - plugin kvm    |                                                   |   - VMs à sauver  |
+|  - dépôt Kloset  |                                                   +-------------------+
++------------------+
+```
+
+Trois rôles :
+
+- **Hôte Plakar** : la machine (souvent une VM dédiée) où tourne Plakar, où est
+  installé le plugin, et où réside le dépôt Kloset.
+- **Hyperviseur** : le nœud KVM/DRBD qui héberge les VM à sauvegarder.
+- **VM invitée** : la VM sauvegardée — **rien à y installer**.
+
+---
+
+## 3. Prérequis par machine
+
+| Composant | Hôte Plakar | Hyperviseur | VM invitée |
+|-----------|:-----------:|:-----------:|:----------:|
+| `plakar` + plugin `kvm` | ✅ | — | — |
+| `virsh` (libvirt-clients) | ✅ | ✅ (déjà présent) | — |
+| client / serveur SSH | ✅ client | ✅ serveur | — |
+| Accès SSH lecture des disques | — | ✅ (root pour DRBD) | — |
+
+**Aucun `qemu-img` ni `qemu-guest-agent` n'est nécessaire.**
+
+### Hôte Plakar
+
+```bash
+apt-get install -y libvirt-clients openssh-client
+# + le binaire plakar (selon votre méthode d'installation habituelle)
+```
+
+### Hyperviseur
+
+```bash
+apt-get install -y openssh-server        # RHEL : dnf install -y openssh-server
+```
+- libvirt/QEMU sont déjà là (c'est un hyperviseur).
+- **DRBD** : les sauvegardes se font sur le nœud **Primary** (seul endroit où
+  `/dev/drbd…` est lisible).
+
+### VM invitée
+
+Rien.
+
+---
+
+## 4. Configurer l'accès SSH (obligatoire pour le mode distant)
+
+Depuis l'**hôte Plakar**, un accès SSH **par clé** et **non interactif** vers
+l'hyperviseur, avec un utilisateur autorisé à lire les images / block devices
+(**`root`** pour les devices DRBD) :
+
+```bash
+# sur l'hôte Plakar
+test -f ~/.ssh/id_ed25519 || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+ssh-copy-id root@<hyperviseur>
+
+# TEST : doit réussir SANS mot de passe
+ssh -o BatchMode=yes root@<hyperviseur> 'virsh version'
+```
+
+> **Important :** si ce test demande un mot de passe, le plugin ne fonctionnera
+> pas. Vérifiez la clé et les permissions (`~/.ssh` en 700, `authorized_keys` en
+> 600 côté hyperviseur).
+
+---
+
+## 5. Construire et installer le plugin
+
+À faire **une fois**, sur une machine disposant de **Go ≥ 1.24** (réseau requis
+pour récupérer les dépendances) :
+
+```bash
+git clone https://gitea.roullier.net/SysTeam/plakar-kvm.git
+cd plakar-kvm
+go mod tidy
+make build            # produit kvmImporter et kvmExporter
+plakar pkg create manifest.yaml v0.3.0
+#   -> kvm_v0.3.0_linux_amd64.ptar
+```
+
+Installer le paquet sur l'**hôte Plakar** :
+
+```bash
+# copier le .ptar sur l'hôte Plakar si besoin, puis :
+plakar pkg add ./kvm_v0.3.0_linux_amd64.ptar
+plakar pkg show                       # doit lister kvm@v0.3.0 (importer + exporter)
+```
+
+> Mise à jour du plugin : rebuild avec un nouveau numéro de version,
+> `plakar pkg rm kvm` puis `plakar pkg add` le nouveau `.ptar`.
+
+---
+
+## 6. Sauvegarder
+
+### 6.1 Créer le dépôt Kloset (une fois)
+
+```bash
+mkdir -p /var/backups/kvm
+plakar at /var/backups/kvm create     # définir une passphrase — À CONSERVER
+```
+
+> **La passphrase est irrécupérable si perdue.** Notez-la dans votre coffre de
+> secrets.
+
+### 6.2 Déclarer une source et lancer la sauvegarde
+
+La `location` encode tout : `kvm://[<user>@]<hyperviseur>/system`.
+
+```bash
+# toutes les VM de l'hyperviseur
+plakar source add kvmProd kvm://root@<hyperviseur>/system
+plakar at /var/backups/kvm backup @kvmProd
+
+# ou seulement certaines VM
+plakar source add kvmWeb kvm://root@<hyperviseur>/system domains=web01,web02
+plakar at /var/backups/kvm backup @kvmWeb
+```
+
+Pour une **sauvegarde locale** (Plakar installé sur l'hyperviseur) :
+`kvm:///system` au lieu de `kvm://root@<hyperviseur>/system`.
+
+### 6.3 Vérifier
+
+```bash
+plakar at /var/backups/kvm ls                         # liste des snapshots
+plakar at /var/backups/kvm ls <SNAPID>:/              # arborescence
+plakar at /var/backups/kvm ls <SNAPID>:/<vm>/disks    # disque(s) + taille
+plakar at /var/backups/kvm check <SNAPID>             # intégrité (déchiffre + checksums)
+```
+
+Arborescence d'un snapshot :
+
+```
+/<vm>/domain.xml
+/<vm>/disks/<nom-du-disque>
+```
+
+---
+
+## 7. Restaurer
+
+La restauration **dépose les fichiers** de la sauvegarde sur l'hyperviseur (par
+SSH), dans un répertoire dédié. Elle **ne redéfinit pas** et **ne démarre pas** la
+VM, et **ne touche jamais** aux devices DRBD de production — la remise en service
+est un geste admin explicite.
+
+```bash
+plakar at /var/backups/kvm restore -to kvm://root@<hyperviseur>/system <SNAPID>
+```
+
+Résultat sur l'hyperviseur :
+
+```
+/var/lib/libvirt/images/plakar-restore/<vm>/domain.xml
+/var/lib/libvirt/images/plakar-restore/<vm>/disks/<nom-du-disque>
+```
+
+> **Espace :** restaurer un disque de N Go écrit un fichier de N Go. Vérifiez
+> `df -h /var/lib/libvirt/images` sur l'hyperviseur avant.
+
+### Remettre la VM en service (manuel)
+
+Sur l'hyperviseur, deux options :
+
+**Option A — démarrer depuis le fichier restauré** (test / DR rapide) :
+```bash
+cd /var/lib/libvirt/images/plakar-restore/<vm>
+# éditer domain.xml : renommer la VM, pointer <disk><source> vers disks/<nom>,
+# retirer les balises <uuid> et <mac> pour éviter les conflits
+virsh define domain.xml
+virsh start <vm>
+```
+
+**Option B — réécrire le disque sur un volume dédié** :
+```bash
+qemu-img convert -O raw disks/<nom> /dev/<volume-de-test>
+# puis define avec le XML pointant sur ce volume
+```
+
+> **DRBD :** pour un test, écrivez sur un volume **dédié/neuf** — n'écrasez
+> jamais le device Primary de production sans fenêtre de maintenance.
+
+---
+
+## 8. Limitations connues
+
+- **Pas de sauvegarde incrémentale** sur disques **raw** (dont DRBD) : chaque
+  sauvegarde **relit le disque entier**. C'est une limite de libvirt/QEMU (les
+  dirty bitmaps persistants exigent du qcow2). **Conséquence :** le *temps de
+  lecture* est proportionnel à la taille provisionnée du disque, mais le
+  *stockage* reste petit grâce à la déduplication Kloset (les zéros et les données
+  inchangées ne sont pas re-stockés).
+  - Conseil : planifier les sauvegardes **hors heures de production**.
+- **Cohérence crash-consistent** uniquement (pas de quiesce applicatif). Adapté
+  aux FS journalisés et à la plupart des charges. Les bases de données très
+  sensibles peuvent nécessiter un dump applicatif complémentaire.
+- **Restauration semi-automatique** : les fichiers sont restaurés, la
+  redéfinition de la VM est manuelle (par sécurité).
+
+---
+
+## 9. Sécurité / durcissement production
+
+- **Utilisateur SSH dédié** plutôt que `root` : sur l'hyperviseur,
+  `useradd -m -G libvirt,disk backup` (groupe `libvirt` pour piloter les VM,
+  `disk` pour lire les block devices), puis `location = kvm://backup@<hv>/system`.
+- **Clé SSH dédiée et restreinte** (dans `authorized_keys` de l'hyperviseur) :
+  `from="<ip-hôte-plakar>",no-port-forwarding,no-pty ssh-ed25519 AAAA...`.
+- **Passphrase du dépôt** : via un gestionnaire de secrets, pas en clair.
+- **Permissions** : clé privée et config Plakar en `600`, répertoire `700`.
+- **Réseau** : SSH sur un réseau d'administration filtré.
+- L'**hôte Plakar** peut lire toutes les VM → traitez-le comme un **actif
+  sensible** (Tier-0), isolé et durci.
+
+---
+
+## 10. Dépannage
+
+| Symptôme | Cause probable | Action |
+|----------|----------------|--------|
+| SSH demande un mot de passe | clé absente / mauvaises permissions | refaire `ssh-copy-id`, vérifier `~/.ssh` (700), `authorized_keys` (600) |
+| `virsh: command not found` (plugin) | `libvirt-clients` manquant sur l'hôte Plakar | `apt-get install libvirt-clients` |
+| Snapshot vide (0 B) au parcours | filtre `domains=` qui ne matche aucune VM | vérifier le nom exact : `virsh -c qemu+ssh://root@<hv>/system list --all --name` |
+| Backup « bloqué » vers X Mio | disque volumineux lu en entier (les zéros ne font pas monter le compteur) | patienter ; vérifier que la lecture avance (`grep drbd /proc/diskstats` sur l'hyperviseur) |
+| `snapshot-create-as` échoue | overlay orphelin d'un backup interrompu | `virsh blockcommit <vm> <cible> --active --pivot --wait` puis supprimer l'overlay `…-plakar-*.qcow2` |
+| Overlay `…-plakar-*.qcow2` résiduel après backup | backup interrompu (ne jamais couper un backup) | idem : `blockcommit --active --pivot --wait` + `rm` de l'overlay |
+| Restauration : plus d'espace | fichier disque volumineux | libérer / cibler un autre volume ; `df -h /var/lib/libvirt/images` |
+
+> **Ne jamais interrompre un backup en cours** : cela laisse un overlay attaché à
+> la VM. Si c'est arrivé, récupérez avec `blockcommit --active --pivot --wait`.
+
+---
+
+## 11. Référence rapide
+
+**Options de configuration** (source *et* destination) :
+
+| Clé | Obligatoire | Description |
+|-----|:-----------:|-------------|
+| `location` | ✅ | `kvm://[<user>@]<hyperviseur>/system` (ou `kvm:///system` en local) |
+| `domains` | — | liste de VM séparées par des virgules (défaut : toutes) — *sauvegarde uniquement* |
+
+**Commandes essentielles :**
+
+```bash
+# dépôt
+plakar at <repo> create
+plakar at <repo> ls
+plakar at <repo> check <SNAPID>
+
+# source / sauvegarde
+plakar source add <nom> kvm://root@<hv>/system [domains=vm1,vm2]
+plakar at <repo> backup @<nom>
+
+# restauration
+plakar at <repo> restore -to kvm://root@<hv>/system <SNAPID>
+
+# plugin
+plakar pkg show
+plakar pkg add ./kvm_vX.Y.Z_linux_amd64.ptar
+```
+
+---
+
+*Dépôt du plugin : `gitea.roullier.net/SysTeam/plakar-kvm`. Contact :
+loic.harrang@roullier.com.*
