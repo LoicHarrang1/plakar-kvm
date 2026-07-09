@@ -228,6 +228,13 @@ func (p *Importer) importDomain(ctx context.Context, domain string, records chan
 	}
 
 	if running {
+		// Crash guard rail: if a previous backup was killed, the guest may still
+		// be on a leftover overlay — revert it to its base disk and delete the
+		// overlay before we snapshot again. Then re-read the (clean) disk list.
+		p.recoverOrphanOverlays(ctx, domain, disks)
+		if refreshed, err := p.virsh.listDisks(ctx, domain); err == nil {
+			disks = refreshed
+		}
 		// Consistent point-in-time via external snapshot.
 		p.importDisksSnapshot(ctx, domain, disks, records)
 	} else {

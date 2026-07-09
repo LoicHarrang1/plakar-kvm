@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,14 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 	snapname := fmt.Sprintf("plakar-%d", ts)
 	args, overlays, targets := buildSnapshotArgs(domain, snapname, disks, overlayDir, ts)
 
+	// Clear any stale file left at a target overlay path by an interrupted run,
+	// otherwise libvirt refuses with "external snapshot file already exists".
+	// Safe: these are the paths we are about to create, and the guest is back on
+	// its base disk (recoverOrphanOverlays ran first).
+	for _, o := range overlays {
+		_ = p.access.removeTemp(ctx, o)
+	}
+
 	if _, err := p.virsh.run(ctx, args...); err != nil {
 		records <- connectors.NewError(vmPath(domain), fmt.Errorf("snapshot-create-as: %w", err))
 		return
@@ -64,6 +73,17 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 		var relOnce sync.Once
 		release := func() { relOnce.Do(sess.release) }
 
+		// Safety net: never back up a leftover overlay — that would store a partial
+		// delta instead of the disk. recoverOrphanOverlays should have collapsed it
+		// first; if not, fail loudly rather than silently store garbage.
+		if isPlakarOverlay(domain, base) {
+			records <- connectors.NewError(diskPath, fmt.Errorf(
+				"disk %s is on a leftover plakar overlay %q; recover with: virsh blockcommit %s %s --active --pivot --wait",
+				d.Target, base, domain, d.Target))
+			release()
+			continue
+		}
+
 		fi, err := p.access.stat(ctx, base)
 		if err != nil {
 			records <- connectors.NewError(diskPath, err)
@@ -80,6 +100,35 @@ func (p *Importer) importDisksSnapshot(ctx context.Context, domain string, disks
 				}
 				return &sessionReader{ReadCloser: rc, release: release}, nil
 			})
+	}
+}
+
+// isPlakarOverlay reports whether a disk source is one of our leftover snapshot
+// overlays (named "<domain>-<target>-plakar-<ts>.qcow2"). Such a source means a
+// previous backup was interrupted before its cleanup ran.
+func isPlakarOverlay(domain, source string) bool {
+	b := path.Base(source)
+	return strings.HasPrefix(b, domain+"-") && strings.Contains(b, "-plakar-") && strings.HasSuffix(b, ".qcow2")
+}
+
+// recoverOrphanOverlays is the crash guard rail: before a backup, if a disk is
+// still on a leftover overlay (a previous run was killed before cleaning up), it
+// merges the overlay back into the base (pivoting the guest onto its raw disk)
+// and deletes the overlay file. Best-effort — failures are logged, not fatal.
+func (p *Importer) recoverOrphanOverlays(ctx context.Context, domain string, disks []diskInfo) {
+	for _, d := range disks {
+		if !isPlakarOverlay(domain, d.Source) {
+			continue
+		}
+		log.Printf("[kvm] %s: disk %s is on a leftover overlay %s from an interrupted backup; reverting to base", domain, d.Target, d.Source)
+		if _, err := p.virsh.run(ctx, "blockcommit", domain, d.Target, "--active", "--pivot", "--wait"); err != nil {
+			log.Printf("[kvm] recovery blockcommit %s/%s failed: %v", domain, d.Target, err)
+			continue // do NOT delete the overlay: the guest still uses it
+		}
+		// Guest is back on its base disk; the leftover overlay is unused -> delete.
+		if err := p.access.removeTemp(ctx, d.Source); err != nil {
+			log.Printf("[kvm] removing leftover overlay %s failed: %v", d.Source, err)
+		}
 	}
 }
 
@@ -126,17 +175,23 @@ func (s *snapshotSession) release() {
 	s.commit()
 }
 
-// commit merges every overlay back into its base and removes the overlay files.
+// commit merges each overlay back into its base (pivoting the guest onto its
+// original raw/qcow2 disk) and then deletes the now-unused overlay file.
+//
+// The delete happens ONLY when blockcommit succeeded: while the guest still runs
+// on an overlay, deleting it would corrupt the VM. targets[i] and overlays[i] are
+// parallel (see buildSnapshotArgs).
 func (s *snapshotSession) commit() {
 	ctx := context.Background()
-	for _, t := range s.targets {
+	for i, t := range s.targets {
+		overlay := s.overlays[i]
 		if _, err := s.imp.virsh.run(ctx, "blockcommit", s.domain, t, "--active", "--pivot", "--wait"); err != nil {
-			log.Printf("[kvm] blockcommit %s/%s failed: %v (overlay may need manual cleanup)", s.domain, t, err)
+			log.Printf("[kvm] blockcommit %s/%s failed: %v — keeping overlay %s (guest may still use it)", s.domain, t, err, overlay)
+			continue
 		}
-	}
-	for _, o := range s.overlays {
-		if err := s.imp.access.removeTemp(ctx, o); err != nil {
-			log.Printf("[kvm] removing overlay %s failed: %v", o, err)
+		// Guest is back on its base disk; the overlay is now unused -> delete it.
+		if err := s.imp.access.removeTemp(ctx, overlay); err != nil {
+			log.Printf("[kvm] removing overlay %s failed: %v", overlay, err)
 		}
 	}
 	s.imp.forgetSession(s)

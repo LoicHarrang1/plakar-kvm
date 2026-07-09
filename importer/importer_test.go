@@ -122,6 +122,24 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+func TestIsPlakarOverlay(t *testing.T) {
+	cases := map[string]bool{
+		"/var/lib/libvirt/images/test-plakar-win-sda-plakar-1783589672.qcow2": true,
+		"/var/lib/libvirt/images/win-vda-plakar-1700000000.qcow2":             true,
+		"/var/lib/libvirt/images/win.qcow2":                                   false,
+		"/dev/drbd/by-res/vgkvm-sas-lv-win/0":                                 false,
+		"/var/lib/libvirt/images/other-vm-vda-plakar-1.qcow2":                 false, // different domain
+	}
+	for src, want := range cases {
+		if got := isPlakarOverlay("win", src); got != want {
+			t.Errorf("isPlakarOverlay(win, %q) = %v, want %v", src, got, want)
+		}
+	}
+	if !isPlakarOverlay("test-plakar-win", "/var/lib/libvirt/images/test-plakar-win-sda-plakar-1783589672.qcow2") {
+		t.Errorf("should detect the incident overlay")
+	}
+}
+
 func TestNvramPath(t *testing.T) {
 	uefi := []byte(`<domain type='kvm'>
   <name>win11</name>
