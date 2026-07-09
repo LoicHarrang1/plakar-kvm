@@ -1,4 +1,5 @@
 /kvmImporter
+/kvmExporter
 /kvm-*.ptar
 *.o
 *.out

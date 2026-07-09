@@ -88,6 +88,43 @@ $ plakar source add someVMs kvm://root@FR-KVM-TEST1/system domains=web01,web02
 $ plakar backup @someVMs
 ```
 
+## Restore
+
+The `kvm` **exporter** restores a snapshot (domain XML + disk images) as files on
+the target hypervisor, under `/var/lib/libvirt/images/plakar-restore/<domain>/`
+(local or over SSH). It intentionally does **not** redefine or start the domain
+and never writes to DRBD/production devices — restoring is a deliberate,
+reviewable operation.
+
+```bash
+# restore a snapshot onto the hypervisor (files land under plakar-restore/)
+$ plakar restore -to kvm://root@FR-KVM-TEST1/system <snapid>
+```
+
+Result on the hypervisor:
+
+```
+/var/lib/libvirt/images/plakar-restore/<domain>/domain.xml
+/var/lib/libvirt/images/plakar-restore/<domain>/disks/<image-basename>
+```
+
+Then, to bring the VM back (manual, so you control name/placement):
+
+```bash
+# [hypervisor] adjust the definition and put the disk where it belongs
+$ cd /var/lib/libvirt/images/plakar-restore/<domain>
+# option A — run from the restored file: edit domain.xml <disk> source to point
+#   at disks/<image-basename>, then:
+$ virsh define domain.xml && virsh start <domain>
+# option B — restore onto a (new/dedicated) DRBD/block device:
+$ qemu-img convert -O raw disks/<image-basename> /dev/<target-volume>
+#   then define with the original XML.
+```
+
+> The restored disk is the raw content captured at snapshot time. For a
+> DRBD-backed VM, write it to a **dedicated/new** volume for testing — never
+> overwrite the live Primary device without a maintenance window.
+
 ## Building and installing
 
 The plugin targets Linux/KVM hosts. On such a host:
