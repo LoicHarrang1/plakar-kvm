@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 )
@@ -39,6 +40,7 @@ func (v *virsh) command(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 func (v *virsh) run(ctx context.Context, args ...string) ([]byte, error) {
+	log.Printf("[kvm][virsh] -c %s %s", v.connectURI, strings.Join(args, " "))
 	var stdout, stderr bytes.Buffer
 	cmd := v.command(ctx, args...)
 	cmd.Stdout = &stdout
